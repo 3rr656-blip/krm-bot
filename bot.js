@@ -1,190 +1,100 @@
-import {
-  Client,
-  GatewayIntentBits,
-  ActivityType,
-  PresenceUpdateStatus,
-  Routes,
-} from "discord.js";
-import {
-  joinVoiceChannel,
-  VoiceConnectionStatus,
-  entersState,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  NoSubscriberBehavior,
-  StreamType,
-} from "@discordjs/voice";
+import { Client, GatewayIntentBits, ActivityType, PresenceUpdateStatus, Routes } from "discord.js";
+import { joinVoiceChannel, VoiceConnectionStatus, entersState, createAudioPlayer, createAudioResource, AudioPlayerStatus, NoSubscriberBehavior, StreamType } from "@discordjs/voice";
 import { Readable } from "stream";
 import http from "http";
 
-const PORT = Number(process.env["PORT"] ?? "3000");
+const PORT = Number(process.env.PORT ?? 3000);
 
-// Start HTTP server immediately so Render health checks pass
 http.createServer((_, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("KRM Bot is alive!");
-}).listen(PORT, "0.0.0.0", () => {
-  console.log(`[Health] Listening on 0.0.0.0:${PORT}`);
-});
+  res.end("KRM Bot alive!");
+}).listen(PORT, "0.0.0.0", () => console.log(`[Health] Listening on port ${PORT}`));
 
 const BOTS = [
-  { token: process.env["DISCORD_BOT_TOKEN"],   channelId: "1500222726206525450" },
-  { token: process.env["DISCORD_BOT_TOKEN_2"], channelId: "1500222743000649969" },
-  { token: process.env["DISCORD_BOT_TOKEN_3"], channelId: "1508421560946397295" },
-].filter((b): b is { token: string; channelId: string } => !!b.token);
+  { token: process.env.DISCORD_BOT_TOKEN,   channelId: "1500222726206525450" },
+  { token: process.env.DISCORD_BOT_TOKEN_2, channelId: "1500222743000649969" },
+  { token: process.env.DISCORD_BOT_TOKEN_3, channelId: "1508421560946397295" },
+].filter(b => b.token);
 
-if (BOTS.length === 0) {
-  console.error("No bot tokens found.");
-  process.exit(1);
-}
-
+if (BOTS.length === 0) { console.error("No tokens found"); process.exit(1); }
 console.log(`Starting ${BOTS.length} bots...`);
 
-const SILENCE_FRAME = Buffer.from([0xf8, 0xff, 0xfe]);
+const SILENCE = Buffer.from([0xf8, 0xff, 0xfe]);
 
-function makeSilenceStream(): Readable {
-  const stream = new Readable({ read() {} });
-  const interval = setInterval(() => stream.push(SILENCE_FRAME), 20);
-  stream.once("close", () => clearInterval(interval));
-  stream.once("end", () => clearInterval(interval));
-  return stream;
+function silenceStream() {
+  const s = new Readable({ read() {} });
+  const t = setInterval(() => s.push(SILENCE), 20);
+  s.once("close", () => clearInterval(t));
+  return s;
 }
 
-function startSilencePlayer(connection: ReturnType<typeof joinVoiceChannel>, tag: string) {
+function playSilence(conn, tag) {
   try {
-    const player = createAudioPlayer({
-      behaviors: { noSubscriber: NoSubscriberBehavior.Play },
-    });
-    connection.subscribe(player);
-
-    function playLoop() {
-      try {
-        const resource = createAudioResource(makeSilenceStream(), { inputType: StreamType.Opus });
-        player.play(resource);
-      } catch {
-        setTimeout(playLoop, 5000);
-      }
-    }
-
-    player.on(AudioPlayerStatus.Idle, () => playLoop());
-    player.on("error", () => setTimeout(playLoop, 3000));
-    playLoop();
-    console.log(`[${tag}] Silence player active.`);
-  } catch (err) {
-    console.log(`[${tag}] Silence player unavailable (bot will stay connected anyway):`, err);
+    const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+    conn.subscribe(player);
+    const loop = () => {
+      try { player.play(createAudioResource(silenceStream(), { inputType: StreamType.Opus })); }
+      catch { setTimeout(loop, 5000); }
+    };
+    player.on(AudioPlayerStatus.Idle, loop);
+    player.on("error", () => setTimeout(loop, 3000));
+    loop();
+    console.log(`[${tag}] Silence active.`);
+  } catch (e) {
+    console.log(`[${tag}] Silence unavailable:`, e.message);
   }
 }
 
-function createBot(token: string, channelId: string, index: number) {
-  const tag = `Bot#${index + 1}`;
-
-  const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
-  });
-
-  let currentConnection: ReturnType<typeof joinVoiceChannel> | null = null;
-  let isConnecting = false;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function scheduleReconnect(delayMs = 3000) {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(() => { reconnectTimer = null; void connectToVoice(); }, delayMs);
-  }
-
-  async function connectToVoice() {
-    if (isConnecting) return;
-    isConnecting = true;
+function startBot(token, channelId, idx) {
+  const tag = `Bot#${idx + 1}`;
+  const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
+  let conn = null, connecting = false, timer = null;
+  const reconnect = (ms = 3000) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => { timer = null; join(); }, ms);
+  };
+  async function join() {
+    if (connecting) return;
+    connecting = true;
     try {
-      const channel = await client.channels.fetch(channelId);
-      if (!channel || !channel.isVoiceBased()) {
-        console.error(`[${tag}] Not a voice channel`);
-        isConnecting = false;
-        scheduleReconnect(15_000);
-        return;
-      }
-      const vc = channel as import("discord.js").VoiceChannel;
-      console.log(`[${tag}] Joining: ${vc.name} in ${vc.guild.name}`);
-
-      if (currentConnection) {
-        try { currentConnection.removeAllListeners(); currentConnection.destroy(); } catch {}
-        currentConnection = null;
-      }
-
-      currentConnection = joinVoiceChannel({
-        channelId: vc.id,
-        guildId: vc.guild.id,
-        adapterCreator: vc.guild.voiceAdapterCreator,
-        selfDeaf: false,
-        selfMute: false,
+      const ch = await client.channels.fetch(channelId);
+      if (!ch?.isVoiceBased()) { connecting = false; reconnect(15000); return; }
+      console.log(`[${tag}] Joining: ${ch.name}`);
+      if (conn) { try { conn.removeAllListeners(); conn.destroy(); } catch {} conn = null; }
+      conn = joinVoiceChannel({ channelId: ch.id, guildId: ch.guild.id, adapterCreator: ch.guild.voiceAdapterCreator, selfDeaf: false, selfMute: false });
+      conn.on(VoiceConnectionStatus.Disconnected, async () => {
+        try { await Promise.race([entersState(conn, VoiceConnectionStatus.Signalling, 4000), entersState(conn, VoiceConnectionStatus.Connecting, 4000)]); }
+        catch { connecting = false; reconnect(2000); }
       });
-
-      currentConnection.on(VoiceConnectionStatus.Disconnected, async () => {
-        try {
-          await Promise.race([
-            entersState(currentConnection!, VoiceConnectionStatus.Signalling, 4_000),
-            entersState(currentConnection!, VoiceConnectionStatus.Connecting, 4_000),
-          ]);
-        } catch {
-          isConnecting = false;
-          scheduleReconnect(2000);
-        }
-      });
-
-      currentConnection.on(VoiceConnectionStatus.Destroyed, () => {
-        currentConnection = null; isConnecting = false; scheduleReconnect(2000);
-      });
-
-      currentConnection.on("error", () => { isConnecting = false; scheduleReconnect(5000); });
-
-      await entersState(currentConnection, VoiceConnectionStatus.Ready, 30_000);
-      console.log(`[${tag}] In voice channel!`);
-      startSilencePlayer(currentConnection, tag);
-    } catch (err) {
-      console.error(`[${tag}] Failed to join:`, err);
-      scheduleReconnect(10_000);
-    } finally {
-      isConnecting = false;
-    }
+      conn.on(VoiceConnectionStatus.Destroyed, () => { conn = null; connecting = false; reconnect(2000); });
+      conn.on("error", () => { connecting = false; reconnect(5000); });
+      await entersState(conn, VoiceConnectionStatus.Ready, 30000);
+      console.log(`[${tag}] In VC!`);
+      playSilence(conn, tag);
+    } catch (e) {
+      console.error(`[${tag}] Failed:`, e.message);
+      reconnect(10000);
+    } finally { connecting = false; }
   }
-
   client.once("ready", async () => {
-    console.log(`[${tag}] Logged in as ${client.user?.tag}`);
-
-    const setPresence = () => client.user?.setPresence({
-      status: PresenceUpdateStatus.Online,
-      activities: [{ name: "🛒 Visit krms.rmz.gg", type: ActivityType.Streaming, url: "https://twitch.tv/placeholder" }],
-    });
-    setPresence();
-    setInterval(setPresence, 4 * 60 * 1000);
-
-    try {
-      await client.rest.patch(Routes.user(), { body: { bio: "Store\nkrms.rmz.gg\ndiscord.gg/krm" } });
-    } catch {}
-
-    await connectToVoice();
-
+    console.log(`[${tag}] Logged in as ${client.user.tag}`);
+    const presence = () => client.user.setPresence({ status: PresenceUpdateStatus.Online, activities: [{ name: "🛒 Visit krms.rmz.gg", type: ActivityType.Streaming, url: "https://twitch.tv/placeholder" }] });
+    presence();
+    setInterval(presence, 4 * 60 * 1000);
+    try { await client.rest.patch(Routes.user(), { body: { bio: "Store\nkrms.rmz.gg\ndiscord.gg/krm" } }); } catch {}
+    await join();
     setInterval(() => {
-      const s = currentConnection?.state?.status;
-      const ok = s === VoiceConnectionStatus.Ready || s === VoiceConnectionStatus.Signalling || s === VoiceConnectionStatus.Connecting;
-      if (!ok && !isConnecting && !reconnectTimer) scheduleReconnect(1000);
-    }, 15_000);
+      const s = conn?.state?.status;
+      if (s !== VoiceConnectionStatus.Ready && s !== VoiceConnectionStatus.Signalling && s !== VoiceConnectionStatus.Connecting && !connecting && !timer) reconnect(1000);
+    }, 15000);
   });
-
-  client.on("voiceStateUpdate", (oldState, newState) => {
-    if (newState.id !== client.user?.id) return;
-    if (oldState.channelId === channelId && newState.channelId !== channelId) {
-      console.log(`[${tag}] Moved/kicked — rejoining...`);
-      scheduleReconnect(1000);
-    }
+  client.on("voiceStateUpdate", (o, n) => {
+    if (n.id !== client.user.id) return;
+    if (o.channelId === channelId && n.channelId !== channelId) { console.log(`[${tag}] Kicked — rejoining...`); reconnect(1000); }
   });
-
-  client.on("error", (err) => console.error(`[${tag}] Error:`, err.message));
-  client.login(token).catch((err) => console.error(`[${tag}] Login failed:`, err.message));
+  client.on("error", e => console.error(`[${tag}]`, e.message));
+  client.login(token).catch(e => console.error(`[${tag}] Login failed:`, e.message));
 }
 
-process.on("unhandledRejection", (err) => console.error("Unhandled:", err));
-
-BOTS.forEach(({ token, channelId }, i) => {
-  setTimeout(() => createBot(token, channelId, i), i * 2000);
-});
+process.on("unhandledRejection", e => console.error("Unhandled:", e));
+BOTS.forEach(({ token, channelId }, i) => setTimeout(() => startBot(token, channelId, i), i * 2000));
