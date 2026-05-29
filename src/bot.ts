@@ -18,13 +18,14 @@ import {
 import { Readable } from "stream";
 import http from "http";
 
-const PORT = process.env["PORT"] ?? "3000";
+const PORT = Number(process.env["PORT"] ?? "3000");
 
+// Start HTTP server immediately so Render health checks pass
 http.createServer((_, res) => {
-  res.writeHead(200);
+  res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("KRM Bot is alive!");
-}).listen(PORT, () => {
-  console.log(`[Health] Server listening on port ${PORT}`);
+}).listen(PORT, "0.0.0.0", () => {
+  console.log(`[Health] Listening on 0.0.0.0:${PORT}`);
 });
 
 const BOTS = [
@@ -34,7 +35,7 @@ const BOTS = [
 ].filter((b): b is { token: string; channelId: string } => !!b.token);
 
 if (BOTS.length === 0) {
-  console.error("No bot tokens found. Set DISCORD_BOT_TOKEN, DISCORD_BOT_TOKEN_2, DISCORD_BOT_TOKEN_3");
+  console.error("No bot tokens found.");
   process.exit(1);
 }
 
@@ -51,20 +52,28 @@ function makeSilenceStream(): Readable {
 }
 
 function startSilencePlayer(connection: ReturnType<typeof joinVoiceChannel>, tag: string) {
-  const player = createAudioPlayer({
-    behaviors: { noSubscriber: NoSubscriberBehavior.Play },
-  });
-  connection.subscribe(player);
+  try {
+    const player = createAudioPlayer({
+      behaviors: { noSubscriber: NoSubscriberBehavior.Play },
+    });
+    connection.subscribe(player);
 
-  function playLoop() {
-    const resource = createAudioResource(makeSilenceStream(), { inputType: StreamType.Opus });
-    player.play(resource);
+    function playLoop() {
+      try {
+        const resource = createAudioResource(makeSilenceStream(), { inputType: StreamType.Opus });
+        player.play(resource);
+      } catch {
+        setTimeout(playLoop, 5000);
+      }
+    }
+
+    player.on(AudioPlayerStatus.Idle, () => playLoop());
+    player.on("error", () => setTimeout(playLoop, 3000));
+    playLoop();
+    console.log(`[${tag}] Silence player active.`);
+  } catch (err) {
+    console.log(`[${tag}] Silence player unavailable (bot will stay connected anyway):`, err);
   }
-
-  player.on(AudioPlayerStatus.Idle, () => playLoop());
-  player.on("error", () => playLoop());
-  playLoop();
-  console.log(`[${tag}] Silence player active.`);
 }
 
 function createBot(token: string, channelId: string, index: number) {
@@ -142,12 +151,12 @@ function createBot(token: string, channelId: string, index: number) {
   client.once("ready", async () => {
     console.log(`[${tag}] Logged in as ${client.user?.tag}`);
 
-    const presence = () => client.user?.setPresence({
+    const setPresence = () => client.user?.setPresence({
       status: PresenceUpdateStatus.Online,
       activities: [{ name: "🛒 Visit krms.rmz.gg", type: ActivityType.Streaming, url: "https://twitch.tv/placeholder" }],
     });
-    presence();
-    setInterval(presence, 4 * 60 * 1000);
+    setPresence();
+    setInterval(setPresence, 4 * 60 * 1000);
 
     try {
       await client.rest.patch(Routes.user(), { body: { bio: "Store\nkrms.rmz.gg\ndiscord.gg/krm" } });
